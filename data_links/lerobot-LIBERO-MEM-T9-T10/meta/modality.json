@@ -1,0 +1,25 @@
+{
+    "state": {
+        "state": {
+            "start": 0,
+            "end": 8
+        }
+    },
+    "action": {
+        "actions": {
+            "start": 0,
+            "end": 7
+        }
+    },
+    "video": {
+        "agentview_rgb": {
+            "original_key": "observation.images.agentview_rgb"
+        },
+        "eye_in_hand_rgb": {
+            "original_key": "observation.images.eye_in_hand_rgb"
+        }
+    },
+    "annotation": {
+        "human.action.task_description": {"original_key": "task_index"}
+    }
+}
