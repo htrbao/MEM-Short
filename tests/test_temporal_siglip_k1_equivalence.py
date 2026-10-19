@@ -16,7 +16,10 @@ import torch
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 
-from gr00t.model.backbone.eagle2_hg_model.modeling_temporal_siglip import build_temporal_siglip_vision_model
+from gr00t.model.backbone.eagle2_hg_model.modeling_temporal_siglip import (
+    apply_temporal_attention,
+    build_temporal_siglip_vision_model,
+)
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _EAGLE_CONFIG_PATH = os.path.join(
@@ -106,12 +109,8 @@ def test_multiframe_shape_and_finite_tiny_config():
     assert out1.shape == out4.shape, "token count must be unchanged by adding past frames"
     assert torch.isfinite(out4).all()
 
-    # Causality sanity check: perturbing only the OLDEST frame must not change the output
-    # (current-frame query attends causally; changing a frame at t' < t affects the current
-    # token's temporal keys/values -- wait, causal means current CAN see the past, so this
-    # should change. Instead verify the converse: perturbing the CURRENT frame's pixels
-    # changes the output (trivially true) and that a T=1 call is independent of any
-    # (nonexistent) "future".
+    # The current frame attends causally to all past frames, so perturbing only the
+    # OLDEST frame must change the current-frame output.
     pixel_values_4frame_perturbed = pixel_values_4frame.clone()
     pixel_values_4frame_perturbed[:, 0] += 10.0  # perturb the oldest frame only
     with torch.no_grad():
@@ -145,6 +144,92 @@ def test_state_dict_strict_compat_real_gr00t_config():
         stock_out = stock(pixel_values=pixel_values).last_hidden_state
         temporal_out = temporal(pixel_values=pixel_values).last_hidden_state
     assert torch.equal(stock_out, temporal_out)
+
+
+def _reference_space_time_forward(model, pixel_values, every_n):
+    """Naive reference straight from the paper's Appendix C, written independently of the
+    encoder under test: keeps ALL frames through ALL layers (no token dropping), explicit
+    causal mask, and returns post-layernormed current-frame tokens."""
+    vm = model.vision_model
+    cfg = vm.config
+    b, t = pixel_values.shape[:2]
+    z = vm.embeddings.patch_embedding(pixel_values.flatten(0, 1)).flatten(2).transpose(1, 2)
+    z = z + vm.embeddings.position_embedding(vm.embeddings.position_ids)
+    n, c = z.shape[1:]
+    z = z.view(b, t, n, c)
+    offsets = torch.tensor(cfg.video_frame_offsets)
+    omega = 1.0 / (10000.0 ** (torch.arange(c, dtype=torch.float32) / c))
+    e = torch.sin(offsets[:, None] * omega[None])  # (T, C)
+    assert torch.all(e[-1] == 0)
+    h, d = cfg.num_attention_heads, c // cfg.num_attention_heads
+    causal = torch.tril(torch.ones(t, t, dtype=torch.bool))
+
+    def mha(attn, x, mask=None):  # x: (..., L, C)
+        q = attn.q_proj(x).unflatten(-1, (h, d)).transpose(-3, -2)
+        k = attn.k_proj(x).unflatten(-1, (h, d)).transpose(-3, -2)
+        v = attn.v_proj(x).unflatten(-1, (h, d)).transpose(-3, -2)
+        logits = q @ k.transpose(-1, -2) * d**-0.5
+        if mask is not None:
+            logits = logits.masked_fill(~mask, float("-inf"))
+        out = (logits.softmax(-1) @ v).transpose(-3, -2).flatten(-2)
+        return attn.out_proj(out)
+
+    for i, layer in enumerate(vm.encoder.layers):
+        if i % every_n == 0:
+            z = z + e[None, :, None, :]
+            zt = z.transpose(1, 2)  # (B, N, T, C)
+            zt = zt + mha(layer.self_attn, layer.layer_norm1(zt), causal)
+            z = zt.transpose(1, 2)
+        z = z + mha(layer.self_attn, layer.layer_norm1(z))
+        z = z + layer.mlp(layer.layer_norm2(z))
+    return vm.post_layernorm(z[:, -1])
+
+
+def test_matches_appendix_c_reference_tiny_config():
+    """Multi-frame output must match an independent from-the-equations reference (which
+    also verifies that dropping past tokens after the last temporal layer is lossless)."""
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.num_hidden_layers = 10  # last temporal layer = 8, so layer 9 runs on current frame only
+    config.video_frame_offsets = [-30.0, -20.0, -10.0, 0.0]
+    model = build_temporal_siglip_vision_model(config, temporal_attn_every_n_layers=4).eval()
+    pixel_values = torch.randn(2, 4, 3, config.image_size, config.image_size)
+    with torch.no_grad():
+        out = model(pixel_values=pixel_values).last_hidden_state
+        ref = _reference_space_time_forward(model, pixel_values, every_n=4)
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
+
+
+def test_temporal_attention_is_causal():
+    """A frame's temporal-attention output must not depend on any later frame."""
+    torch.manual_seed(0)
+    config = _tiny_config()
+    attn = SiglipVisionModel(config).vision_model.encoder.layers[0].self_attn.eval()
+    x = torch.randn(5, 4, config.hidden_size)
+    x_perturbed = x.clone()
+    x_perturbed[:, -1] += 10.0
+    with torch.no_grad():
+        out = apply_temporal_attention(attn, x)
+        out_perturbed = apply_temporal_attention(attn, x_perturbed)
+    torch.testing.assert_close(out[:, :-1], out_perturbed[:, :-1])
+    assert not torch.allclose(out[:, -1], out_perturbed[:, -1])
+
+
+def test_gradient_checkpointing_matches():
+    torch.manual_seed(0)
+    config = _tiny_config()
+    config.video_frame_offsets = [-2.0, -1.0, 0.0]
+    model = build_temporal_siglip_vision_model(config, temporal_attn_every_n_layers=4).train()
+    pixel_values = torch.randn(2, 3, 3, config.image_size, config.image_size)
+
+    model(pixel_values=pixel_values).last_hidden_state.square().sum().backward()
+    grads = {k: p.grad.clone() for k, p in model.named_parameters() if p.grad is not None}
+    model.zero_grad()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model(pixel_values=pixel_values).last_hidden_state.square().sum().backward()
+    for k, p in model.named_parameters():
+        if k in grads:
+            torch.testing.assert_close(p.grad, grads[k], rtol=1e-4, atol=1e-5)
 
 
 if __name__ == "__main__":

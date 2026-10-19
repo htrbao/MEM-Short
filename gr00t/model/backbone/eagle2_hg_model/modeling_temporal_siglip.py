@@ -3,25 +3,25 @@
 
 Implements the video-encoder design from "MEM: Multi-Scale Embodied Memory for VLA
 Models" (arXiv:2603.03596), Section III-C / Appendix C: a ViT vision encoder is extended
-to attend across K past+current frames by interleaving standard spatial (within-frame)
-attention with a temporal (across-frame, fixed patch index, causal) attention pass every
-`temporal_attn_every_n_layers` layers. The temporal pass reuses that SAME layer's
-`SiglipAttention` Q/K/V/O projection weights -- no new learnable parameters are added
-anywhere in this file. A fixed (non-learnable), pure-sine temporal position embedding is
-added to patch embeddings once at the input, with the property that it is exactly zero at
-offset 0 (the current frame) for every channel.
+to attend across K past+current frames with space-time separable attention. Every
+`temporal_attn_every_n_layers`th layer first adds a fixed sinusoidal temporal position
+embedding e(t) (e(0)=0) to its input, then runs a causal temporal attention pass (across
+frames, fixed patch index) followed by the standard spatial (within-frame) attention, both
+reusing that SAME layer's LayerNorm and `SiglipAttention` Q/K/V/O weights -- no new
+learnable parameters are added anywhere in this file. Past-frame tokens are dropped after
+the last temporal layer, so only current-frame tokens reach the VLM backbone.
 
 Frame ordering convention (enforced by construction, relied on throughout this file):
 frames are ordered oldest -> newest, with the CURRENT frame always last (index T-1).
 `video_frame_offsets` on the config must be an ascending list ending in 0, e.g.
 `[-60, -40, -20, 0]`.
 
-K=1 exact-reduction requirement (see plan): rather than relying on the temporal position
+K=1 exact-reduction requirement: rather than relying on the temporal position
 embedding's `e(0)=0` alone (which does NOT by itself make a single-key attention op an
 identity -- `out_proj(v_proj(x))` is a nonzero learned affine map of `x`), both
 `TemporalSiglipVisionEmbeddings.forward` and `TemporalSiglipEncoder.forward` explicitly
 delegate to their stock parent-class implementation whenever the input has no separate
-time axis (4D `(B,C,H,W)` pixel_values / 3D `(B,N,C)` embeddings). This means the K=1 case
+time axis (4D `(B,C,H,W)` pixel_values / 3D `(B,N,C)` embeddings) or T == 1. This means the K=1 case
 runs the literal, unmodified stock code path -- not just a numerically-equivalent one.
 
 Because `build_temporal_siglip_vision_model` returns a genuine `SiglipVisionModel`
@@ -93,23 +93,19 @@ def apply_temporal_attention(attn: SiglipAttention, x_bntc: torch.Tensor) -> tor
 
 
 class TemporalSiglipVisionEmbeddings(SiglipVisionEmbeddings):
-    """Adds a fixed temporal position embedding on top of stock per-frame patch+spatial-pos embeddings.
+    """Per-frame stock patch+spatial-pos embeddings for a (B, T, C, H, W) frame stack.
 
     `__init__` is inherited unchanged from `SiglipVisionEmbeddings`, so `patch_embedding` /
     `position_embedding` / `position_ids` keep identical names and shapes to stock -- zero
     new parameters, full state_dict compatibility with a stock pretrained checkpoint.
+
+    The temporal position embedding e(t) is NOT added here: per the paper's Appendix C it is
+    added to the input of every temporal-attention layer (see TemporalSiglipEncoder).
     """
 
     def __init__(self, config):
         super().__init__(config)
-        frame_offsets = list(getattr(config, "video_frame_offsets", [0.0]))
-        assert frame_offsets[-1] == 0.0, (
-            "video_frame_offsets must end in 0 (current frame last) -- "
-            f"got {frame_offsets}"
-        )
-        self.register_buffer(
-            "video_frame_offsets", torch.tensor(frame_offsets, dtype=torch.float32), persistent=False
-        )
+        self.num_frames = len(getattr(config, "video_frame_offsets", [0.0]))
 
     def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False) -> torch.Tensor:
         if pixel_values.dim() == 4:
@@ -119,34 +115,80 @@ class TemporalSiglipVisionEmbeddings(SiglipVisionEmbeddings):
 
         assert pixel_values.dim() == 5, f"expected (B,C,H,W) or (B,T,C,H,W), got {tuple(pixel_values.shape)}"
         b, t, c, h, w = pixel_values.shape
-        assert t == self.video_frame_offsets.shape[0], (
-            f"pixel_values has T={t} frames but config.video_frame_offsets has "
-            f"{self.video_frame_offsets.shape[0]} entries ({self.video_frame_offsets.tolist()})"
+        assert t == self.num_frames, (
+            f"pixel_values has T={t} frames but config.video_frame_offsets has {self.num_frames} entries"
         )
         flat = pixel_values.reshape(b * t, c, h, w)
         embeds = super().forward(flat, interpolate_pos_encoding=interpolate_pos_encoding)  # (B*T, N, D)
-        n, d = embeds.shape[1], embeds.shape[2]
-        embeds = embeds.view(b, t, n, d)
-        if t > 1:
-            temporal_pe = sinusoidal_temporal_embedding(
-                self.video_frame_offsets, d, embeds.dtype, embeds.device
-            )  # (T, D), zero at the current-frame row
-            embeds = embeds + temporal_pe[None, :, None, :]
-        return embeds  # (B, T, N, D)
+        return embeds.view(b, t, embeds.shape[1], embeds.shape[2])  # (B, T, N, D)
 
 
 class TemporalSiglipEncoder(SiglipEncoder):
-    """Drop-in replacement for SiglipEncoder that interleaves temporal attention every Nth layer.
+    """Drop-in replacement for SiglipEncoder implementing space-time separable attention.
 
-    `__init__` (beyond the new `temporal_attn_every_n_layers` int, stored as a plain python
-    attribute -- not a buffer/parameter) is inherited unchanged, so `self.layers` holds the
-    exact same 27 `SiglipEncoderLayer` instances with identical parameter names/shapes as
-    stock `SiglipEncoder` -- zero new parameters.
+    Every `temporal_attn_every_n_layers`th layer l (0-indexed, l % n == 0) is modified as in
+    the paper's Appendix C:
+
+        z_hat = z + e(t)                                   # e(0) = 0
+        z_hat = z_hat + Attn_time(LN1(z_hat))              # causal, same patch across t
+        z_hat = z_hat + Attn_space(LN1(z_hat))             # bidirectional, within frame
+        out   = z_hat + MLP(LN2(z_hat))
+
+    i.e. Eq. (3)'s composition alpha_space[alpha_time[z_hat]] (temporal first, as in
+    TimeSformer's divided space-time attention), with both attention passes reusing the
+    layer's own LN1 + SiglipAttention Q/K/V/O weights. All other layers are stock.
+
+    Past-timestep tokens are dropped right after the last temporal layer: later layers are
+    spatial-only, so past frames can no longer influence the current frame and carrying
+    them further would be wasted compute. The encoder thus returns only current-frame
+    tokens, matching the token count of a single-frame ViT.
+
+    `__init__` is inherited unchanged apart from a non-persistent offsets buffer and a plain
+    int, so `self.layers` holds the exact same `SiglipEncoderLayer` instances with identical
+    parameter names/shapes as stock -- zero new parameters.
     """
 
     def __init__(self, config, temporal_attn_every_n_layers: int = 4):
         super().__init__(config)
         self.temporal_attn_every_n_layers = temporal_attn_every_n_layers
+        frame_offsets = list(getattr(config, "video_frame_offsets", [0.0]))
+        assert frame_offsets == sorted(frame_offsets) and frame_offsets[-1] == 0.0, (
+            f"video_frame_offsets must be ascending and end in 0 (current frame last) -- got {frame_offsets}"
+        )
+        self.register_buffer(
+            "video_frame_offsets", torch.tensor(frame_offsets, dtype=torch.float32), persistent=False
+        )
+        temporal_layers = [
+            i for i in range(config.num_hidden_layers) if i % temporal_attn_every_n_layers == 0
+        ]
+        self.last_temporal_layer = temporal_layers[-1]
+
+    def _space_time_layer(self, layer, hidden_states: torch.Tensor, temporal_pe: torch.Tensor):
+        """One modified layer. hidden_states: (B, T, N, C); temporal_pe: (T, C)."""
+        b, t, n, c = hidden_states.shape
+
+        # z_hat = z + e(t)
+        hidden_states = hidden_states + temporal_pe[None, :, None, :]
+
+        # temporal attention: one length-T sequence per (batch, patch), causal.
+        residual = hidden_states
+        x = layer.layer_norm1(hidden_states)
+        x = x.permute(0, 2, 1, 3).reshape(b * n, t, c)
+        x = apply_temporal_attention(layer.self_attn, x)
+        hidden_states = residual + x.reshape(b, n, t, c).permute(0, 2, 1, 3)
+
+        # spatial attention: standard per-frame block 1, unchanged.
+        hidden_states = hidden_states.reshape(b * t, n, c)
+        residual = hidden_states
+        x = layer.layer_norm1(hidden_states)
+        x, _ = layer.self_attn(x, None, output_attentions=False)
+        hidden_states = residual + x
+
+        # MLP: standard block 2, unchanged.
+        residual = hidden_states
+        x = layer.mlp(layer.layer_norm2(hidden_states))
+        hidden_states = residual + x
+        return hidden_states.view(b, t, n, c)
 
     def forward(
         self,
@@ -155,67 +197,61 @@ class TemporalSiglipEncoder(SiglipEncoder):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
-        if inputs_embeds.dim() == 3:
-            # Stock (B, N, C) single-frame path -- delegate to the literal parent
-            # implementation, unmodified (exact K=1 reduction guarantee).
+        if inputs_embeds.dim() == 3 or inputs_embeds.shape[1] == 1:
+            # Single-frame path -- delegate to the literal stock implementation (exact K=1
+            # reduction guarantee). Note attention over a length-1 sequence is NOT an
+            # identity (out_proj(v_proj(x)) is a nonzero learned map), so T==1 must skip
+            # the temporal pass explicitly rather than rely on e(0)=0.
+            if inputs_embeds.dim() == 4:
+                inputs_embeds = inputs_embeds[:, 0]
             return super().forward(inputs_embeds, attention_mask, output_attentions, output_hidden_states)
 
         assert inputs_embeds.dim() == 4, f"expected (B,N,C) or (B,T,N,C), got {tuple(inputs_embeds.shape)}"
         assert attention_mask is None, "attention_mask is not supported in the multi-frame video-memory path"
+        assert not output_attentions, "output_attentions is not supported in the multi-frame video-memory path"
         b, t, n, c = inputs_embeds.shape
-        output_attentions = bool(
-            output_attentions if output_attentions is not None else self.config.output_attentions
+        assert t == self.video_frame_offsets.shape[0], (
+            f"got T={t} frames but video_frame_offsets has {self.video_frame_offsets.shape[0]} entries"
         )
         output_hidden_states = bool(
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         encoder_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
 
-        hidden_states = inputs_embeds.reshape(b * t, n, c)
+        temporal_pe = sinusoidal_temporal_embedding(
+            self.video_frame_offsets, c, inputs_embeds.dtype, inputs_embeds.device
+        )  # (T, C), zero at the current-frame row
+
+        hidden_states = inputs_embeds  # (B, T, N, C) up to the last temporal layer, then (B, N, C)
         for layer_idx, layer in enumerate(self.layers):
+            is_video = layer_idx <= self.last_temporal_layer
             if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states.view(b, t, n, c)[:, -1],)
+                # only current-frame states are exposed (select_layer consumers expect (B, N, C))
+                encoder_states = encoder_states + ((hidden_states[:, -1] if is_video else hidden_states),)
 
-            # -- spatial block: standard SiglipEncoderLayer block 1 (LN1 -> self_attn ->
-            # residual), applied independently per (batch, frame) "image", unchanged. --
-            residual = hidden_states
-            x = layer.layer_norm1(hidden_states)
-            attn_out, attn_weights = layer.self_attn(x, None, output_attentions=output_attentions)
-            hidden_states = residual + attn_out
-            if output_attentions:
-                all_attentions = all_attentions + (attn_weights,)
+            if layer_idx % self.temporal_attn_every_n_layers == 0:
+                args = (layer, hidden_states, temporal_pe)
+                fn = self._space_time_layer
+            elif is_video:
+                args = (hidden_states.reshape(b * t, n, c), None)
+                fn = lambda x, m, layer=layer: layer(x, m)[0].view(b, t, n, c)  # noqa: E731
+            else:
+                args = (hidden_states, None)
+                fn = lambda x, m, layer=layer: layer(x, m)[0]  # noqa: E731
 
-            # -- temporal block (every `temporal_attn_every_n_layers`th layer): additional
-            # causal attention pass over the T axis at fixed patch index, reusing THIS
-            # layer's self_attn weights, with its own residual add, inserted before the
-            # MLP block -- see module docstring / plan Stage A / paper Appendix C.
-            # Explicit `t > 1` guard (not numerically emergent): attention over a
-            # length-1 sequence is NOT an identity -- out_proj(v_proj(x)) is a nonzero
-            # learned affine map of x, even though softmax over one key is trivially 1.
-            # Skipping this block entirely at t==1 is what makes that case bit-identical
-            # to stock (verified in tests/test_temporal_siglip_k1_equivalence.py). --
-            if t > 1 and layer_idx % self.temporal_attn_every_n_layers == 0:
-                residual_t = hidden_states
-                x_btnc = hidden_states.view(b, t, n, c)
-                x_bn_t_c = x_btnc.permute(0, 2, 1, 3).reshape(b * n, t, c)
-                temporal_out = apply_temporal_attention(layer.self_attn, x_bn_t_c)
-                temporal_out = temporal_out.reshape(b, n, t, c).permute(0, 2, 1, 3).reshape(b * t, n, c)
-                hidden_states = residual_t + temporal_out
+            if self.gradient_checkpointing and self.training:
+                hidden_states = self._gradient_checkpointing_func(fn, *args)
+            else:
+                hidden_states = fn(*args)
 
-            # -- MLP block: standard SiglipEncoderLayer block 2 (LN2 -> mlp -> residual),
-            # unchanged. --
-            residual = hidden_states
-            x = layer.layer_norm2(hidden_states)
-            x = layer.mlp(x)
-            hidden_states = residual + x
+            if layer_idx == self.last_temporal_layer:
+                # drop past-timestep tokens: (B, T, N, C) -> (B, N, C), current frame only
+                hidden_states = hidden_states[:, -1]
 
-        hidden_states = hidden_states.view(b, t, n, c)
-        current = hidden_states[:, -1]  # (B, N, C) -- current-timestep tokens only
         if output_hidden_states:
-            encoder_states = encoder_states + (current,)
+            encoder_states = encoder_states + (hidden_states,)
 
-        return BaseModelOutput(last_hidden_state=current, hidden_states=encoder_states, attentions=all_attentions)
+        return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=None)
 
 
 def build_temporal_siglip_vision_model(config, temporal_attn_every_n_layers: int = 4) -> SiglipVisionModel:

@@ -148,6 +148,11 @@ class ArgsConfig:
     """Insert a temporal-attention pass every Nth ViT layer (0-indexed). Only used when
     use_video_memory=True."""
 
+    video_encoder_grad_ckpt: bool = True
+    """Gradient-checkpoint the video encoder's ViT layers (only when use_video_memory and
+    tune_visual). Activations of K frames x V views through every ViT layer otherwise
+    dominate GPU memory."""
+
 
 #####################################################################################
 # Helper functions
@@ -365,6 +370,10 @@ def main(config: ArgsConfig):
         new_backbone_cfg["video_frame_offsets"] = video_frame_offsets
         new_backbone_cfg["temporal_attn_every_n_layers"] = config.temporal_attn_every_n_layers
         new_backbone = EagleBackbone(**new_backbone_cfg)
+        # backbone_cfg carries the checkpoint's tune_* flags; re-apply the CLI ones.
+        new_backbone.set_trainable_parameters(
+            tune_llm=config.tune_llm, tune_visual=config.tune_visual
+        )
 
         # MEM-short introduces no new learnable parameters (see modeling_temporal_siglip.py's
         # module docstring) -- strict=True here is itself a sanity check that this property
@@ -379,6 +388,10 @@ def main(config: ArgsConfig):
 
         model.backbone = new_backbone
         model.config.backbone_cfg = new_backbone_cfg
+        if config.tune_visual and config.video_encoder_grad_ckpt:
+            model.backbone.eagle_model.vision_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
     # Set the model's compute_dtype to bfloat16
     model.compute_dtype = "bfloat16"
@@ -396,7 +409,7 @@ def main(config: ArgsConfig):
     # 2.1 modify training args
     training_args = TrainingArguments(
         output_dir=config.output_dir,
-        run_name=None,
+        run_name=os.path.basename(os.path.normpath(config.output_dir)),
         remove_unused_columns=False,
         deepspeed="",
         gradient_checkpointing=False,
