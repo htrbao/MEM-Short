@@ -849,6 +849,18 @@ class LiberoMemVideoMemoryDataConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 
 
+class LiberoMemT0910VideoMemoryDataConfig(LiberoMemVideoMemoryDataConfig):
+    """LIBERO-Mem T09/T10 (lerobot-LIBERO_MEM-T09_10-landmark), agentview only.
+
+    Matches the MEM paper's pre-training memory setting: K=6 observations (5 past + current)
+    at a 1s stride -> 20 frames @ 20fps, i.e. 5s of observation memory (episodes are
+    ~14-20s long). Proprio history uses the same K via state_horizon.
+    """
+
+    video_keys = ["video.agentview_rgb"]
+    observation_indices = [-100, -80, -60, -40, -20, 0]
+
+
 class RmBenchVideoMemoryDataConfig(BaseDataConfig):
     video_keys = ["video.head_camera_rgb"]
     state_keys = [
@@ -912,6 +924,34 @@ class RmBenchVideoMemoryDataConfig(BaseDataConfig):
         return ComposedModalityTransform(transforms=transforms)
 
 
+class Vrh3PlacePartVideoMemoryDataConfig(RmBenchVideoMemoryDataConfig):
+    """VRH3 part-placing sim (vrh3-part-placing-simulation-landmark), front camera only,
+    joint-position state only (no velocity/effort) -- same keys/transforms as HAMLET's
+    `vrh3_two_hand` baseline minus the velocity/effort state blocks.
+
+    K=6 observations (5 past + current) at a 1s stride -> 20 frames @ 20fps, i.e. 5s of
+    observation memory (episodes are 156-1487 frames, mean ~16.5s), matching
+    `libero_mem_t09_10_video_memory`. Proprio history uses the same K via state_horizon.
+    """
+
+    video_keys = ["video.cam_front"]
+    state_keys = [
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_hand",
+        "state.right_hand",
+    ]
+    action_keys = [
+        "action.left_arm",
+        "action.right_arm",
+        "action.left_hand",
+        "action.right_hand",
+    ]
+    language_keys = ["annotation.human.task_description"]
+    observation_indices = [-100, -80, -60, -40, -20, 0]
+    action_indices = list(range(16))
+
+
 ###########################################################################################
 
 DATA_CONFIG_MAP = {
@@ -928,5 +968,7 @@ DATA_CONFIG_MAP = {
     "oxe_droid": OxeDroidDataConfig(),
     "agibot_genie1": AgibotGenie1DataConfig(),
     "libero_mem_video_memory": LiberoMemVideoMemoryDataConfig(),
+    "libero_mem_t09_10_video_memory": LiberoMemT0910VideoMemoryDataConfig(),
     "rmbench_video_memory": RmBenchVideoMemoryDataConfig(),
+    "vrh3_placepart_video_memory": Vrh3PlacePartVideoMemoryDataConfig(),
 }
